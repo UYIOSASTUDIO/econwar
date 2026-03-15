@@ -118,18 +118,18 @@ impl App {
 
     /// Whether the user is at the bottom of the log (auto-scroll enabled).
     fn is_at_bottom(&self) -> bool {
-        // Consider "at bottom" if within 3 lines of the end.
-        self.log_scroll + 3 >= self.log_messages.len()
+        self.log_scroll == 0
     }
 
     pub fn log(&mut self, msg: &str) {
-        let was_at_bottom = self.is_at_bottom();
         let timestamp = chrono::Local::now().format("%H:%M:%S");
         self.log_messages.push(format!("[{timestamp}] {msg}"));
-        // Only auto-scroll if user was already at the bottom.
-        // If they scrolled up to read, don't yank them away.
-        if was_at_bottom {
-            self.log_scroll = self.log_messages.len().saturating_sub(1);
+
+        // Wenn der Nutzer gerade nach oben gescrollt hat (Offset > 0),
+        // erhöhen wir den Offset mit jeder neuen Nachricht.
+        // So bleibt der Text, den er gerade liest, stabil stehen.
+        if self.log_scroll > 0 {
+            self.log_scroll += 1;
         }
     }
 
@@ -150,30 +150,25 @@ impl App {
     }
 
     pub fn scroll_up(&mut self) {
-        self.log_scroll = self.log_scroll.saturating_sub(1);
+        // Nach oben scrollen bedeutet, sich weiter vom Boden zu entfernen
+        self.log_scroll += 1;
     }
 
     pub fn scroll_down(&mut self) {
-        if self.log_scroll < self.log_messages.len().saturating_sub(1) {
-            self.log_scroll += 1;
-        }
+        // Nach unten scrollen nähert sich der 0
+        self.log_scroll = self.log_scroll.saturating_sub(1);
     }
 
-    /// Scroll up by a full page (10 lines).
     pub fn scroll_up_page(&mut self) {
+        self.log_scroll += 10;
+    }
+
+    pub fn scroll_down_page(&mut self) {
         self.log_scroll = self.log_scroll.saturating_sub(10);
     }
 
-    /// Scroll down by a full page (10 lines).
-    pub fn scroll_down_page(&mut self) {
-        self.log_scroll = (self.log_scroll + 10).min(
-            self.log_messages.len().saturating_sub(1),
-        );
-    }
-
-    /// Jump to the bottom of the log.
     pub fn scroll_to_bottom(&mut self) {
-        self.log_scroll = self.log_messages.len().saturating_sub(1);
+        self.log_scroll = 0;
     }
 
     /// Refresh market data from the server.

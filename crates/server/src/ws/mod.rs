@@ -7,7 +7,6 @@ use axum::{
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use redis::AsyncCommands;
 use tokio::sync::broadcast;
 
 use crate::state::SharedState;

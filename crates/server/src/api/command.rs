@@ -13,6 +13,7 @@ use econwar_core::commands::{CommandResult, GameCommand};
 use econwar_core::models::*;
 use econwar_db::repo;
 use crate::state::{SharedState, ServerEvent};
+use crate::game_loop::GameCommand as LoopCommand; // Alias, um Namenskonflikte zu vermeiden
 
 /// Request payload: the command plus the acting player.
 #[derive(serde::Deserialize)]
@@ -37,6 +38,7 @@ async fn handle_command(
 ) -> CommandResult {
     match cmd {
         // ── Create Company ──────────────────────────────────────────
+        // TODO (Architektur): Muss zukünftig in den LoopCommand Channel migriert werden
         GameCommand::CreateCompany { name } => {
             let company = Company {
                 id: Uuid::new_v4(),
@@ -59,8 +61,8 @@ async fn handle_command(
         }
 
         // ── Fund Company ────────────────────────────────────────────
+        // TODO (Architektur): Muss zukünftig in den LoopCommand Channel migriert werden
         GameCommand::FundCompany { company_id, amount } => {
-            // Deduct from player, add to company treasury.
             if let Err(e) = repo::update_player_balance(&state.db, player_id, -amount).await {
                 return CommandResult::err(format!("Failed: {e}"));
             }
@@ -71,6 +73,7 @@ async fn handle_command(
         }
 
         // ── Hire Workers ────────────────────────────────────────────
+        // TODO (Architektur): Muss zukünftig in den LoopCommand Channel migriert werden
         GameCommand::HireWorkers { company_id, count } => {
             let company = match repo::get_company(&state.db, company_id).await {
                 Ok(Some(c)) => c,
@@ -96,6 +99,7 @@ async fn handle_command(
         }
 
         // ── Build Factory ───────────────────────────────────────────
+        // TODO (Architektur): Muss zukünftig in den LoopCommand Channel migriert werden
         GameCommand::BuildFactory { company_id } => {
             let mut company = match repo::get_company(&state.db, company_id).await {
                 Ok(Some(c)) => c,
@@ -116,12 +120,13 @@ async fn handle_command(
             ).await;
             CommandResult::ok(
                 format!("Factory built! Total: {}. New capacity: {} workers",
-                    company.factories, company.worker_capacity),
+                        company.factories, company.worker_capacity),
                 None,
             )
         }
 
         // ── Research Technology ──────────────────────────────────────
+        // TODO (Architektur): Muss zukünftig in den LoopCommand Channel migriert werden
         GameCommand::ResearchTechnology { company_id } => {
             let company = match repo::get_company(&state.db, company_id).await {
                 Ok(Some(c)) => c,
@@ -142,7 +147,7 @@ async fn handle_command(
             )
         }
 
-        // ── Buy Resource (place buy order) ──────────────────────────
+        // ── Buy Resource (Event-Driven) ─────────────────────────────
         GameCommand::BuyResource { company_id, resource_slug, quantity, max_price } => {
             let resource = match repo::get_resource_by_slug(&state.db, &resource_slug).await {
                 Ok(Some(r)) => r,
@@ -150,20 +155,20 @@ async fn handle_command(
             };
             let total_cost = max_price * quantity;
 
-            // Check company treasury.
+            // Read-Only Check: Hat das Unternehmen genug Geld?
             let company = match repo::get_company(&state.db, company_id).await {
                 Ok(Some(c)) => c,
                 _ => return CommandResult::err("Company not found"),
             };
+
+            // In einer perfekten Event-Sourcing Welt wird der Kontostand erst in der Engine
+            // geblockt (Escrow). Für den Moment belassen wir die Vorab-Validierung hier.
             if company.treasury < total_cost {
                 return CommandResult::err(format!(
                     "Insufficient treasury: need {total_cost}, have {}",
                     company.treasury
                 ));
             }
-
-            // Reserve funds.
-            let _ = repo::update_company_treasury(&state.db, company_id, -total_cost).await;
 
             let order = TradeOrder {
                 id: Uuid::new_v4(),
@@ -177,22 +182,27 @@ async fn handle_command(
                 status: OrderStatus::Open,
                 created_at: Utc::now(),
             };
-            let _ = repo::insert_trade_order(&state.db, &order).await;
+
+            // Non-blocking Push in die In-Memory Engine
+            if let Err(e) = state.cmd_tx.send(LoopCommand::CreateOrder(order.clone())).await {
+                tracing::error!("Engine overload - failed to route Buy order: {}", e);
+                return CommandResult::err("Market engine is currently overloaded.");
+            }
 
             CommandResult::ok(
-                format!("Buy order placed: {quantity} {resource_slug} @ {max_price}"),
+                format!("Buy order placed: {quantity} {resource_slug} @ {max_price}. Awaiting execution."),
                 Some(serde_json::to_value(&order).unwrap()),
             )
         }
 
-        // ── Sell Resource (place sell order) ─────────────────────────
+        // ── Sell Resource (Event-Driven) ─────────────────────────────
         GameCommand::SellResource { company_id, resource_slug, quantity, min_price } => {
             let resource = match repo::get_resource_by_slug(&state.db, &resource_slug).await {
                 Ok(Some(r)) => r,
                 _ => return CommandResult::err(format!("Unknown resource: {resource_slug}")),
             };
 
-            // Check inventory.
+            // Read-Only Check: Ist die Ressource im Inventar?
             let inventory = repo::get_inventory(&state.db, company_id).await.unwrap_or_default();
             let held: Decimal = inventory
                 .iter()
@@ -206,9 +216,6 @@ async fn handle_command(
                 ));
             }
 
-            // Reserve resources (deduct from inventory).
-            let _ = repo::upsert_inventory(&state.db, company_id, resource.id, -quantity).await;
-
             let order = TradeOrder {
                 id: Uuid::new_v4(),
                 player_id,
@@ -221,15 +228,20 @@ async fn handle_command(
                 status: OrderStatus::Open,
                 created_at: Utc::now(),
             };
-            let _ = repo::insert_trade_order(&state.db, &order).await;
+
+            // Non-blocking Push in die In-Memory Engine
+            if let Err(e) = state.cmd_tx.send(LoopCommand::CreateOrder(order.clone())).await {
+                tracing::error!("Engine overload - failed to route Sell order: {}", e);
+                return CommandResult::err("Market engine is currently overloaded.");
+            }
 
             CommandResult::ok(
-                format!("Sell order placed: {quantity} {resource_slug} @ {min_price}"),
+                format!("Sell order placed: {quantity} {resource_slug} @ {min_price}. Awaiting execution."),
                 Some(serde_json::to_value(&order).unwrap()),
             )
         }
 
-        // ── Scan Market ─────────────────────────────────────────────
+        // ── Scan Market (Read-Only) ──────────────────────────────────
         GameCommand::ScanMarket { resource_slug } => {
             let resource = match repo::get_resource_by_slug(&state.db, &resource_slug).await {
                 Ok(Some(r)) => r,
@@ -241,13 +253,13 @@ async fn handle_command(
             };
             CommandResult::ok(
                 format!("{}: price={} ema={} supply={} demand={}",
-                    resource_slug, market.last_price, market.ema_price,
-                    market.total_supply, market.total_demand),
+                        resource_slug, market.last_price, market.ema_price,
+                        market.total_supply, market.total_demand),
                 Some(serde_json::to_value(&market).unwrap()),
             )
         }
 
-        // ── Scan All Markets ────────────────────────────────────────
+        // ── Scan All Markets (Read-Only) ────────────────────────────
         GameCommand::ScanAllMarkets => {
             let markets = repo::get_all_markets(&state.db).await.unwrap_or_default();
             let resources = repo::get_all_resources(&state.db).await.unwrap_or_default();
@@ -267,6 +279,7 @@ async fn handle_command(
         }
 
         // ── Start Production ────────────────────────────────────────
+        // TODO (Architektur): Muss zukünftig in den LoopCommand Channel migriert werden
         GameCommand::StartProduction { company_id, recipe_slug, batch_size } => {
             let recipes = repo::get_all_recipes(&state.db).await.unwrap_or_default();
             let recipe = match recipes.iter().find(|r| r.slug == recipe_slug) {
@@ -283,18 +296,15 @@ async fn handle_command(
                 &company, recipe, batch_size, &inventories,
             ) {
                 Ok(plan) => {
-                    // Apply deductions.
                     for (resource_id, qty) in &plan.deductions {
                         let _ = repo::upsert_inventory(&state.db, company_id, *resource_id, -*qty).await;
                     }
-                    // Allocate workers.
                     let new_workers = company.workers + plan.workers_allocated;
                     let _ = repo::update_company_workers(&state.db, company_id, new_workers).await;
-                    // Insert job.
                     let _ = repo::insert_production_job(&state.db, &plan.job).await;
                     CommandResult::ok(
                         format!("Production started: {} x{batch_size} ({} ticks)",
-                            recipe.name, recipe.ticks_required),
+                                recipe.name, recipe.ticks_required),
                         Some(serde_json::to_value(&plan.job).unwrap()),
                     )
                 }
@@ -302,7 +312,7 @@ async fn handle_command(
             }
         }
 
-        // ── List Recipes ────────────────────────────────────────────
+        // ── List Recipes (Read-Only) ────────────────────────────────
         GameCommand::ListRecipes => {
             let recipes = repo::get_all_recipes(&state.db).await.unwrap_or_default();
             CommandResult::ok(
@@ -311,7 +321,7 @@ async fn handle_command(
             )
         }
 
-        // ── View Company ────────────────────────────────────────────
+        // ── View Company (Read-Only) ────────────────────────────────
         GameCommand::ViewCompany { company_id } => {
             match repo::get_company(&state.db, company_id).await {
                 Ok(Some(c)) => CommandResult::ok("Company details", Some(serde_json::to_value(&c).unwrap())),
@@ -319,7 +329,7 @@ async fn handle_command(
             }
         }
 
-        // ── View Inventory ──────────────────────────────────────────
+        // ── View Inventory (Read-Only) ──────────────────────────────
         GameCommand::ViewInventory { company_id } => {
             let inv = repo::get_inventory(&state.db, company_id).await.unwrap_or_default();
             CommandResult::ok(
@@ -328,7 +338,7 @@ async fn handle_command(
             )
         }
 
-        // ── View Balance ────────────────────────────────────────────
+        // ── View Balance (Read-Only) ────────────────────────────────
         GameCommand::ViewBalance => {
             match repo::get_player_by_id(&state.db, player_id).await {
                 Ok(Some(p)) => CommandResult::ok(
@@ -339,7 +349,7 @@ async fn handle_command(
             }
         }
 
-        // ── List Companies ──────────────────────────────────────────
+        // ── List Companies (Read-Only) ──────────────────────────────
         GameCommand::ListCompanies => {
             let companies = repo::get_companies_by_owner(&state.db, player_id)
                 .await
@@ -350,21 +360,29 @@ async fn handle_command(
             )
         }
 
-        // ── Global Chat ─────────────────────────────────────────────
+        // ── Global Chat (Redis Pub/Sub) ─────────────────────────────
         GameCommand::GlobalChat { message } => {
-            let username = state.sessions.get(&player_id)
-                .map(|v| v.clone())
-                .unwrap_or_else(|| "anonymous".to_string());
+            let username = match repo::get_player_by_id(&state.db, player_id).await {
+                Ok(Some(player)) => player.username,
+                _ => "anonymous".to_string(),
+            };
 
-            state.broadcast(ServerEvent::ChatMessage {
-                username: username.clone(),
+            let _ = state.broadcast_to_redis(ServerEvent::ChatMessage {
+                username,
                 message: message.clone(),
                 timestamp: Utc::now().to_rfc3339(),
-            });
+            }).await;
+
             CommandResult::ok("Message sent", None)
         }
 
-        // ── Catch-all for unimplemented commands ────────────────────
+        // ── Cancel Order (Not implemented) ──────────────────────────
+        GameCommand::CancelOrder { .. } => {
+            CommandResult::err("Order cancellation is managed by the in-memory engine and is not yet implemented.")
+        }
+
+        // ── Catch-all ───────────────────────────────────────────────
+        #[allow(unreachable_patterns)]
         _ => CommandResult::err("Command not yet implemented"),
     }
 }

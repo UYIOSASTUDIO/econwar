@@ -26,6 +26,14 @@ pub struct EconomicEngine {
 /// The server applies these transactionally to the database.
 #[derive(Debug, Default, Clone)]
 pub struct TickEffects {
+    // ── Von der API injizierte Effekte ───────────────────────────────
+    pub new_companies: Vec<Company>,
+    pub updated_companies: Vec<Company>,
+    pub new_jobs: Vec<ProductionJob>,
+    pub new_orders: Vec<TradeOrder>,
+    pub cancelled_orders: Vec<Uuid>,
+
+    // ── Von der Engine berechnete Effekte ────────────────────────────
     pub updated_jobs: Vec<ProductionJob>,
     pub inventory_deltas: Vec<(Uuid, Uuid, Decimal)>,
     pub treasury_deltas: Vec<(Uuid, Decimal)>,

@@ -71,14 +71,21 @@ fn draw_log_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let visible_height = inner.height as usize;
     let total = app.log_messages.len();
-    let start = if total <= visible_height { 0 } else {
-        app.log_scroll.min(total.saturating_sub(visible_height))
-    };
+
+    // Maximal möglicher Offset nach oben
+    let max_scroll = total.saturating_sub(visible_height);
+
+    // Wir kappen den Zähler des Users, falls er zu weit hochgescrollt hat
+    let clamped_scroll = app.log_scroll.min(max_scroll);
+
+    // Start-Index berechnen: Maximaler Index minus den Offset vom Boden
+    let start = max_scroll.saturating_sub(clamped_scroll);
     let end = (start + visible_height).min(total);
 
     let items: Vec<ListItem> = app.log_messages[start..end]
         .iter()
         .map(|msg| {
+            // ... (Hier bleibt dein bisheriger Style-Code exakt gleich) ...
             let style = if msg.contains("OK:") {
                 Style::default().fg(Color::Green)
             } else if msg.contains("ERR:") {

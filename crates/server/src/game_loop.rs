@@ -30,7 +30,18 @@ pub struct TickBatch {
 pub enum GameCommand {
     CreateOrder(TradeOrder),
     CancelOrder(uuid::Uuid),
-    // Weitere Commands wie CreateCompany etc.
+    CreateCompany(Company),
+    StartProduction(ProductionJob),
+    UpdateCompany(Company),
+}
+
+/// Temporäre Struktur für API-Effekte innerhalb eines Ticks
+struct ApiEffects {
+    new_companies: Vec<Company>,
+    updated_companies: Vec<Company>,
+    new_jobs: Vec<ProductionJob>,
+    new_orders: Vec<TradeOrder>,
+    cancelled_orders: Vec<uuid::Uuid>,
 }
 
 pub struct GameLoopActor {
@@ -108,9 +119,11 @@ impl GameLoopActor {
         loop {
             interval.tick().await;
 
-            self.process_commands();
+            // 1. Verarbeite alle API-Requests, die seit dem letzten Tick reingekommen sind
+            let api_effects = self.process_commands();
 
-            let effects = self.engine.tick(
+            // 2. Führe die Kern-Simulation mit dem aktualisierten RAM-Status durch
+            let mut effects = self.engine.tick(
                 &self.companies,
                 &mut self.jobs,
                 &self.recipes,
@@ -120,46 +133,75 @@ impl GameLoopActor {
                 &mut self.sells,
             );
 
-            let tick_count = self.engine.tick_count;
+            // 3. Führe API-Effekte und Engine-Effekte zusammen
+            effects.new_companies = api_effects.new_companies;
+            effects.updated_companies = api_effects.updated_companies;
+            effects.new_jobs = api_effects.new_jobs;
+            effects.new_orders = api_effects.new_orders;
+            effects.cancelled_orders = api_effects.cancelled_orders;
 
+            let tick_count = self.engine.tick_count;
             let batch = TickBatch {
                 tick_count,
                 effects: effects.clone(),
             };
 
-            // Non-blocking Weitergabe an den Persistenz-Layer.
-            // try_send verhindert I/O-Stau im Berechnungs-Thread.
+            // 4. Asynchrones Write-Behind an den DbWriterActor
             if let Err(e) = self.db_tx.try_send(batch) {
                 tracing::error!("CRITICAL: Write-behind queue overflow at tick {}: {}", tick_count, e);
             }
 
-            self.broadcast_updates(&effects);
+            self.broadcast_updates(&effects).await;
         }
     }
 
-    /// Verarbeitet alle in der Warteschlange liegenden API-Befehle asynchron.
-    fn process_commands(&mut self) {
-        // try_recv liest den Channel aus, ohne zu blockieren,
-        // bis er leer ist.
+    /// Verarbeitet die Warteschlange der API-Befehle synchron im RAM
+    fn process_commands(&mut self) -> ApiEffects {
+        let mut effects = ApiEffects {
+            new_companies: Vec::new(),
+            updated_companies: Vec::new(),
+            new_jobs: Vec::new(),
+            new_orders: Vec::new(),
+            cancelled_orders: Vec::new(),
+        };
+
         while let Ok(cmd) = self.cmd_rx.try_recv() {
             match cmd {
                 GameCommand::CreateOrder(order) => {
                     let type_str = format!("{:?}", order.order_type).to_lowercase();
                     if type_str == "buy" {
-                        self.buys.push(order);
+                        self.buys.push(order.clone());
                     } else {
-                        self.sells.push(order);
+                        self.sells.push(order.clone());
                     }
+                    effects.new_orders.push(order);
                 }
-                GameCommand::CancelOrder(_order_id) => {
-                    // TODO: Implementierung der Order Cancellation Logik im RAM.
+                GameCommand::CancelOrder(order_id) => {
+                    self.buys.retain(|o| o.id != order_id);
+                    self.sells.retain(|o| o.id != order_id);
+                    effects.cancelled_orders.push(order_id);
+                }
+                GameCommand::CreateCompany(company) => {
+                    self.companies.push(company.clone());
+                    effects.new_companies.push(company);
+                }
+                GameCommand::StartProduction(job) => {
+                    self.jobs.push(job.clone());
+                    effects.new_jobs.push(job);
+                }
+                GameCommand::UpdateCompany(updated_company) => {
+                    if let Some(c) = self.companies.iter_mut().find(|c| c.id == updated_company.id) {
+                        *c = updated_company.clone();
+                    }
+                    effects.updated_companies.push(updated_company);
                 }
             }
         }
+        effects
     }
 
     /// Sendet den aktuellen Marktstatus an verbundene WebSocket-Clients.
-    fn broadcast_updates(&self, effects: &TickEffects) {
+    async fn broadcast_updates(&self, effects: &TickEffects) {
         let slugs: std::collections::HashMap<uuid::Uuid, String> = self.resources
             .iter()
             .map(|r| (r.id, r.slug.clone()))
@@ -180,7 +222,7 @@ impl GameLoopActor {
             .collect();
 
         if !briefs.is_empty() {
-            self.state.broadcast(ServerEvent::MarketUpdate { markets: briefs });
+            let _ = self.state.broadcast_to_redis(ServerEvent::MarketUpdate { markets: briefs }).await;
         }
     }
 }

@@ -46,21 +46,26 @@ pub struct MarketBrief {
 pub struct AppState {
     pub db: PgPool,
     pub redis_pool: Pool<RedisConnectionManager>,
-    /// Local channel to distribute Redis messages to connected WebSockets on this specific instance.
     pub local_ws_tx: broadcast::Sender<String>,
+    // Channel-Sender, damit API-Requests Kommandos an den GameLoopActor schicken können
+    pub cmd_tx: tokio::sync::mpsc::Sender<crate::game_loop::GameCommand>,
 }
 
 impl AppState {
-    pub fn new(db: PgPool, redis_pool: Pool<RedisConnectionManager>) -> Self {
+    pub fn new(
+        db: PgPool,
+        redis_pool: Pool<RedisConnectionManager>,
+        cmd_tx: tokio::sync::mpsc::Sender<crate::game_loop::GameCommand>,
+    ) -> Self {
         let (local_ws_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             db,
             redis_pool,
             local_ws_tx,
+            cmd_tx,
         }
     }
 
-    /// Veröffentlicht ein Event im zentralen Redis-Cluster.
     pub async fn broadcast_to_redis(&self, event: ServerEvent) -> anyhow::Result<()> {
         let mut conn = self.redis_pool.get().await?;
         let payload = serde_json::to_string(&event)?;
@@ -68,7 +73,8 @@ impl AppState {
         redis::cmd("PUBLISH")
             .arg("econwar:ws:broadcast")
             .arg(payload)
-            .query_async(&mut *conn)
+            // Fix: Explizite Angabe, dass wir keinen Rückgabewert erwarten
+            .query_async::<_, ()>(&mut *conn)
             .await?;
 
         Ok(())
