@@ -1,0 +1,19 @@
+[package]
+name = "econwar-tui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "econwar"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }

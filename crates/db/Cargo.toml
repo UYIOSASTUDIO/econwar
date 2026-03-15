@@ -1,0 +1,16 @@
+[package]
+name = "econwar-db"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+econwar-core = { path = "../core" }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
