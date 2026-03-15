@@ -27,3 +27,5 @@ argon2 = { workspace = true }
 dashmap = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"
+redis = { version = "0.25", features = ["tokio-comp", "json"] }
+bb8-redis = "0.15" # Für Connection Pooling

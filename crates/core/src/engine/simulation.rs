@@ -24,22 +24,14 @@ pub struct EconomicEngine {
 
 /// The full set of side-effects produced by one simulation tick.
 /// The server applies these transactionally to the database.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TickEffects {
-    /// Updated production jobs (status, ticks_remaining).
     pub updated_jobs: Vec<ProductionJob>,
-    /// Inventory changes: (owner_id, resource_id, delta).
-    /// Positive delta = add, negative = deduct.
     pub inventory_deltas: Vec<(Uuid, Uuid, Decimal)>,
-    /// Company treasury changes: (company_id, delta).
     pub treasury_deltas: Vec<(Uuid, Decimal)>,
-    /// New NPC sell orders to insert.
     pub npc_orders: Vec<TradeOrder>,
-    /// Results from the matching engine per resource.
     pub match_results: Vec<(Uuid, MatchResult)>,
-    /// Market snapshots to archive.
     pub snapshots: Vec<MarketSnapshot>,
-    /// Updated market states.
     pub updated_markets: Vec<Market>,
 }
 

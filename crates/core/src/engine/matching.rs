@@ -17,13 +17,10 @@ use crate::models::{TradeOrder, OrderStatus, Transaction};
 pub struct MatchingEngine;
 
 /// Result of running the matching engine on a resource's order book.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MatchResult {
-    /// Newly created transactions (fills).
     pub transactions: Vec<Transaction>,
-    /// Orders whose status or quantity changed.
     pub updated_orders: Vec<TradeOrder>,
-    /// The last execution price (if any trades occurred).
     pub last_price: Option<Decimal>,
 }
 
@@ -125,6 +122,7 @@ impl MatchingEngine {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+    use crate::models::OrderType;
 
     fn make_order(
         order_type: OrderType,

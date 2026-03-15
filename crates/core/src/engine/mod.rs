@@ -20,4 +20,4 @@ mod simulation;
 pub use matching::MatchingEngine;
 pub use pricing::PricingEngine;
 pub use production::ProductionEngine;
-pub use simulation::EconomicEngine;
+pub use simulation::{EconomicEngine, TickEffects};

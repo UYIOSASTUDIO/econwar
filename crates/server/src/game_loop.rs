@@ -1,133 +1,186 @@
-//! Background economic simulation loop.
+//! Background economic simulation loop (In-Memory Actor).
 //!
-//! Runs on a dedicated Tokio task.  Every `tick_interval_ms` milliseconds:
-//!   1. Loads relevant state from the database
-//!   2. Runs the economic engine tick
-//!   3. Persists all side-effects back to the database
-//!   4. Broadcasts market updates to WebSocket clients
+//! Runs on a dedicated Tokio task. Every `tick_interval_ms` milliseconds:
+//!   1. Processes incoming commands from the API (REST/WebSocket).
+//!   2. Runs the economic engine tick strictly in memory.
+//!   3. Dispatches side-effects (Deltas) to the DbWriter via an MPSC channel.
+//!   4. Broadcasts market updates to WebSocket clients.
 
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
-use econwar_core::engine::EconomicEngine;
+use econwar_core::engine::{EconomicEngine, TickEffects};
+use econwar_core::models::{
+    Company, Market, ProductionJob, Recipe, Resource, TradeOrder,
+};
 use econwar_db::repo;
 
 use crate::state::{AppState, MarketBrief, ServerEvent};
 
-pub async fn run(state: Arc<AppState>, tick_interval_ms: u64) {
-    let mut engine = EconomicEngine::new();
-    let interval = Duration::from_millis(tick_interval_ms);
-
-    tracing::info!("Game loop started (tick every {}ms)", tick_interval_ms);
-
-    loop {
-        tokio::time::sleep(interval).await;
-
-        if let Err(e) = tick_once(&mut engine, &state).await {
-            tracing::error!("Tick error: {e:#}");
-        }
-    }
+/// Payload für den asynchronen Write-Behind Prozess.
+#[derive(Debug)]
+pub struct TickBatch {
+    pub tick_count: u64,
+    pub effects: TickEffects,
 }
 
-async fn tick_once(engine: &mut EconomicEngine, state: &Arc<AppState>) -> anyhow::Result<()> {
-    let pool = &state.db;
+/// Repräsentiert asynchrone Eingaben von Benutzern, die den Spielstatus verändern.
+#[derive(Debug)]
+pub enum GameCommand {
+    CreateOrder(TradeOrder),
+    CancelOrder(uuid::Uuid),
+    // Weitere Commands wie CreateCompany etc.
+}
 
-    // ── Load state ──────────────────────────────────────────────────
-    let companies = repo::get_all_companies_for_tick(pool).await;
-    let recipes = repo::get_all_recipes(pool).await?;
-    let resources = repo::get_all_resources(pool).await?;
-    let mut markets = repo::get_all_markets(pool).await?;
-    let mut jobs = repo::get_running_jobs(pool).await?;
+pub struct GameLoopActor {
+    engine: EconomicEngine,
+    state: Arc<AppState>,
+    db_tx: mpsc::Sender<TickBatch>,
+    cmd_rx: mpsc::Receiver<GameCommand>,
 
-    // Load all open orders.
-    let mut all_buys = Vec::new();
-    let mut all_sells = Vec::new();
-    for market in &markets {
-        let mut buys = repo::get_open_orders_by_resource(pool, market.resource_id, "buy").await?;
-        let mut sells = repo::get_open_orders_by_resource(pool, market.resource_id, "sell").await?;
-        all_buys.append(&mut buys);
-        all_sells.append(&mut sells);
-    }
+    // In-Memory State
+    companies: Vec<Company>,
+    recipes: Vec<Recipe>,
+    resources: Vec<Resource>,
+    markets: Vec<Market>,
+    jobs: Vec<ProductionJob>,
+    buys: Vec<TradeOrder>,
+    sells: Vec<TradeOrder>,
+}
 
-    // ── Run simulation tick ─────────────────────────────────────────
-    let companies_vec = companies.unwrap_or_default();
-    let effects = engine.tick(
-        &companies_vec,
-        &mut jobs,
-        &recipes,
-        &resources,
-        &mut markets,
-        &mut all_buys,
-        &mut all_sells,
-    );
+impl GameLoopActor {
+    /// Initialisiert den Actor und lädt den Zustand exakt einmal synchron aus der Datenbank.
+    pub async fn new(
+        state: Arc<AppState>,
+        db_tx: mpsc::Sender<TickBatch>,
+        cmd_rx: mpsc::Receiver<GameCommand>,
+    ) -> anyhow::Result<Self> {
+        let pool = &state.db;
 
-    // ── Persist effects ─────────────────────────────────────────────
+        tracing::info!("Initializing GameLoopActor: Loading state from database...");
 
-    // Updated production jobs.
-    for job in &effects.updated_jobs {
-        let _ = repo::update_production_job(pool, job).await;
-    }
+        let companies = repo::get_all_companies_for_tick(pool).await?;
+        let recipes = repo::get_all_recipes(pool).await?;
+        let resources = repo::get_all_resources(pool).await?;
+        let markets = repo::get_all_markets(pool).await?;
+        let jobs = repo::get_running_jobs(pool).await?;
 
-    // Inventory deltas.
-    for (owner_id, resource_id, delta) in &effects.inventory_deltas {
-        let _ = repo::upsert_inventory(pool, *owner_id, *resource_id, *delta).await;
-    }
+        let mut buys = Vec::new();
+        let mut sells = Vec::new();
 
-    // Treasury deltas.
-    for (company_id, delta) in &effects.treasury_deltas {
-        let _ = repo::update_company_treasury(pool, *company_id, *delta).await;
-    }
-
-    // NPC orders.
-    for order in &effects.npc_orders {
-        let _ = repo::insert_trade_order(pool, order).await;
-    }
-
-    // Transactions from matching.
-    for (_rid, match_result) in &effects.match_results {
-        for txn in &match_result.transactions {
-            let _ = repo::insert_transaction(pool, txn).await;
+        for market in &markets {
+            let mut market_buys = repo::get_open_orders_by_resource(pool, market.resource_id, "buy").await?;
+            let mut market_sells = repo::get_open_orders_by_resource(pool, market.resource_id, "sell").await?;
+            buys.append(&mut market_buys);
+            sells.append(&mut market_sells);
         }
-        for order in &match_result.updated_orders {
-            let status_str = format!("{:?}", order.status).to_lowercase();
-            let _ = repo::update_order_status(pool, order.id, order.quantity, &status_str).await;
-        }
-    }
 
-    // Market updates.
-    for market in &effects.updated_markets {
-        let _ = repo::update_market(pool, market).await;
-    }
+        tracing::info!(
+            "Initialization complete. Loaded {} companies, {} markets, {} open orders.",
+            companies.len(),
+            markets.len(),
+            buys.len() + sells.len()
+        );
 
-    // Snapshots.
-    for snap in &effects.snapshots {
-        let _ = repo::insert_snapshot(pool, snap).await;
-    }
-
-    // ── Broadcast market update to WS clients ───────────────────────
-    let slugs: std::collections::HashMap<uuid::Uuid, String> = resources
-        .iter()
-        .map(|r| (r.id, r.slug.clone()))
-        .collect();
-
-    let briefs: Vec<MarketBrief> = effects
-        .updated_markets
-        .iter()
-        .filter_map(|m| {
-            slugs.get(&m.resource_id).map(|slug| MarketBrief {
-                slug: slug.clone(),
-                price: m.last_price.to_string(),
-                ema: m.ema_price.to_string(),
-                supply: m.total_supply.to_string(),
-                demand: m.total_demand.to_string(),
-            })
+        Ok(Self {
+            engine: EconomicEngine::new(),
+            state,
+            db_tx,
+            cmd_rx,
+            companies,
+            recipes,
+            resources,
+            markets,
+            jobs,
+            buys,
+            sells,
         })
-        .collect();
-
-    if !briefs.is_empty() {
-        state.broadcast(ServerEvent::MarketUpdate { markets: briefs });
     }
 
-    tracing::debug!("Tick #{} complete", engine.tick_count);
-    Ok(())
+    /// Startet die dedizierte In-Memory-Berechnungsschleife.
+    pub async fn run(mut self, tick_interval_ms: u64) {
+        let mut interval = tokio::time::interval(Duration::from_millis(tick_interval_ms));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        tracing::info!("GameLoopActor running (tick interval {}ms)", tick_interval_ms);
+
+        loop {
+            interval.tick().await;
+
+            self.process_commands();
+
+            let effects = self.engine.tick(
+                &self.companies,
+                &mut self.jobs,
+                &self.recipes,
+                &self.resources,
+                &mut self.markets,
+                &mut self.buys,
+                &mut self.sells,
+            );
+
+            let tick_count = self.engine.tick_count;
+
+            let batch = TickBatch {
+                tick_count,
+                effects: effects.clone(),
+            };
+
+            // Non-blocking Weitergabe an den Persistenz-Layer.
+            // try_send verhindert I/O-Stau im Berechnungs-Thread.
+            if let Err(e) = self.db_tx.try_send(batch) {
+                tracing::error!("CRITICAL: Write-behind queue overflow at tick {}: {}", tick_count, e);
+            }
+
+            self.broadcast_updates(&effects);
+        }
+    }
+
+    /// Verarbeitet alle in der Warteschlange liegenden API-Befehle asynchron.
+    fn process_commands(&mut self) {
+        // try_recv liest den Channel aus, ohne zu blockieren,
+        // bis er leer ist.
+        while let Ok(cmd) = self.cmd_rx.try_recv() {
+            match cmd {
+                GameCommand::CreateOrder(order) => {
+                    let type_str = format!("{:?}", order.order_type).to_lowercase();
+                    if type_str == "buy" {
+                        self.buys.push(order);
+                    } else {
+                        self.sells.push(order);
+                    }
+                }
+                GameCommand::CancelOrder(_order_id) => {
+                    // TODO: Implementierung der Order Cancellation Logik im RAM.
+                }
+            }
+        }
+    }
+
+    /// Sendet den aktuellen Marktstatus an verbundene WebSocket-Clients.
+    fn broadcast_updates(&self, effects: &TickEffects) {
+        let slugs: std::collections::HashMap<uuid::Uuid, String> = self.resources
+            .iter()
+            .map(|r| (r.id, r.slug.clone()))
+            .collect();
+
+        let briefs: Vec<MarketBrief> = effects
+            .updated_markets
+            .iter()
+            .filter_map(|m| {
+                slugs.get(&m.resource_id).map(|slug| MarketBrief {
+                    slug: slug.clone(),
+                    price: m.last_price.to_string(),
+                    ema: m.ema_price.to_string(),
+                    supply: m.total_supply.to_string(),
+                    demand: m.total_demand.to_string(),
+                })
+            })
+            .collect();
+
+        if !briefs.is_empty() {
+            self.state.broadcast(ServerEvent::MarketUpdate { markets: briefs });
+        }
+    }
 }

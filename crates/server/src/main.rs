@@ -13,6 +13,7 @@ mod middleware;
 mod game_loop;
 mod state;
 mod handler;
+mod db_writer;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 use state::AppState;
+use bb8_redis::RedisConnectionManager;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -49,15 +51,50 @@ async fn main() -> anyhow::Result<()> {
     econwar_db::run_migrations(&pool).await?;
     econwar_db::seed::seed_all(&pool).await?;
 
-    // ── Shared state ────────────────────────────────────────────────
-    let state = Arc::new(AppState::new(pool.clone()));
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
 
-    // ── Game loop (background task) ─────────────────────────────────
-    let loop_state = state.clone();
+    let redis_manager = RedisConnectionManager::new(redis_url)?;
+    let redis_pool = bb8_redis::bb8::Pool::builder()
+        .max_size(15)
+        .build(redis_manager)
+        .await?;
+
+    // ── Shared state ────────────────────────────────────────────────
+    let state = Arc::new(AppState::new(pool.clone(), redis_pool));
+
+    // ── Redis Subscriber Task ───────────────────────────────────────
+    let redis_sub_url = redis_url.clone();
+    let local_tx = state.local_ws_tx.clone();
     tokio::spawn(async move {
-        game_loop::run(loop_state, tick_interval_ms).await;
+        ws::run_redis_subscriber(redis_sub_url, local_tx).await;
     });
 
+    // ── Actor System & Channels ─────────────────────────────────────
+    // Channel für asynchrone Datenbank-Schreibvorgänge
+    let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<game_loop::TickBatch>(100);
+
+    // Channel für eingehende Spieler-Kommandos (Orders etc.)
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<game_loop::GameCommand>(1024);
+
+    // 1. Starte den Database Writer Actor
+    let db_writer_state = state.clone();
+    tokio::spawn(async move {
+        let db_writer = db_writer::DbWriterActor::new(db_writer_state, batch_rx);
+        db_writer.run().await;
+    });
+
+    // 2. Starte den In-Memory Game Loop Actor
+    let loop_state = state.clone();
+    tokio::spawn(async move {
+        match game_loop::GameLoopActor::new(loop_state, batch_tx, cmd_rx).await {
+            Ok(actor) => actor.run(tick_interval_ms).await,
+            Err(e) => tracing::error!("CRITICAL: Failed to initialize GameLoopActor: {}", e),
+        }
+    });
+
+    // TODO: cmd_tx muss später in den AppState integriert werden,
+    // damit die Axum API-Handler Kommandos an den GameLoop senden können.
     // ── Routes ──────────────────────────────────────────────────────
     let cors = CorsLayer::new()
         .allow_origin(Any)
